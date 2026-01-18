@@ -1,0 +1,13 @@
+name = "telegram-bot"
+main = "src/index.js"
+compatibility_date = "2023-10-02"
+
+[vars]
+# TELEGRAM_BOT_TOKEN will be set via `wrangler secret put TELEGRAM_BOT_TOKEN`
+
+[[kv_namespaces]]
+binding = "CTFD_STORE"
+id = "68b4263e349f4c2a879d315208a0f926"
+
+[triggers]
+crons = ["* * * * *"] # Run every 1 minute
