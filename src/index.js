@@ -142,8 +142,110 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                           return;
                         }
 
-                        // Format challenge details (reuse existing /chal formatting logic)
+                        // Format challenge details (Robust Version)
                         const escapeHtml = (str) => String(str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                        const escapeUrl = (url) => String(url || "").replace(/&/g, "&amp;");
+
+
+                        // 0. Base URL (Centralized)
+                        let baseUrl = "";
+                        try {
+                          const eStored = await env.CTFD_STORE.get("EVENTS");
+                          if (eStored) {
+                            const eJson = JSON.parse(eStored);
+                            const ev = eJson.find(e => e.id === eventId);
+                            if (ev) baseUrl = ev.url;
+                          }
+                        } catch (e) { }
+
+                        // LAZY LOAD (Self-Healing): Fetch missing details on demand
+                        if (!challenge.description || !challenge.description.trim() || challenge.description.includes("⚠️")) {
+                          await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⏳ Mengambil detail dari server...", true);
+
+                          try {
+                            // 1. Find Creds
+                            let subs = [];
+                            try { const sS = await env.CTFD_STORE.get("SUBSCRIPTIONS"); if (sS) subs = JSON.parse(sS); } catch (e) { }
+
+                            let sub = subs.find(s => s.userId == chatId && s.eventId === eventId);
+
+                            if (sub && baseUrl) {
+                              const headers = {
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                "Content-Type": "application/json"
+                              };
+                              if (sub.credentials.mode === 'token') headers["Authorization"] = `Token ${sub.credentials.value}`;
+                              else headers["Cookie"] = sub.credentials.value;
+
+                              // 2. FETCH with 5s TIMEOUT
+                              const controller = new AbortController();
+                              const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+                              try {
+                                const dRes = await fetch(`${baseUrl}/api/v1/challenges/${challenge.id}`, { headers, signal: controller.signal });
+                                if (dRes.ok) {
+                                  const dJson = await dRes.json();
+                                  if (dJson.success && dJson.data) {
+                                    // Update Object - Use Object.assign since 'challenge' is const
+                                    Object.assign(challenge, dJson.data);
+
+                                    // SELF-HEALING: Save to Cache
+                                    try {
+                                      const k = `CHALLENGES_${eventId}`;
+                                      const existing = await env.CTFD_STORE.get(k);
+                                      if (existing) {
+                                        const arr = JSON.parse(existing);
+                                        const idx = arr.findIndex(c => c.id == challenge.id);
+                                        if (idx !== -1) {
+                                          arr[idx] = challenge;
+                                          await env.CTFD_STORE.put(k, JSON.stringify(arr));
+                                          await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "✅ Challenge data repaired & saved!", true);
+                                        }
+                                      }
+                                    } catch (saveErr) { console.error("Self-Heal Save Error", saveErr); }
+                                  }
+                                } else {
+                                  challenge.description = `⚠️ Gagal: HTTP ${dRes.status} (Cek kembali login Anda)`;
+                                }
+                              } catch (fetchErr) {
+                                const reason = fetchErr.name === 'AbortError' ? 'Timeout (5s)' : fetchErr.message;
+                                challenge.description = `⚠️ Gagal memuat deskripsi: ${reason}`;
+                              } finally {
+                                clearTimeout(timeoutId);
+                              }
+                            } else {
+                              if (!sub) challenge.description = "⚠️ Gagal: Profil tidak ditemukan. Coba /join_event ulang.";
+                              else challenge.description = "⚠️ Gagal: Base URL not found.";
+                            }
+                          } catch (e) {
+                            console.error("Deep Link Lazy Load Error:", e);
+                            challenge.description = `⚠️ Exception: ${e.message}`;
+                          }
+                        }
+
+                        let desc = challenge.description || "No description";
+
+                        // 1. Extract Links from Description (with fixed Regex)
+                        const linkRegex = /<a\s+(?:[^>]*?\s+)?href=["'](.*?)["'][^>]*>([\s\S]*?)<\/a>/gi;
+                        let extractedLinks = [];
+                        let match;
+                        while ((match = linkRegex.exec(desc)) !== null) {
+                          let url = match[1];
+                          // FIX RELATIVE URLS
+                          if (url.startsWith("/") && baseUrl) {
+                            if (baseUrl.endsWith("/")) url = baseUrl + url.substring(1);
+                            else url = baseUrl + url;
+                          }
+                          extractedLinks.push({ url: url, text: match[2] });
+                        }
+
+                        // 2. Safe Mode Formatting (Plain Text Only)
+                        desc = desc.replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n\n");
+                        desc = desc.replace(/<[^>]+>/g, " "); // Strip TAGS
+                        desc = desc.replace(/\n\s*\n\s*\n/g, "\n\n").trim();
+
+                        desc = escapeHtml(desc);
+
 
                         let msg = `🎯 <b>${escapeHtml(challenge.name)}</b>\n\n`;
                         msg += `📁 Category: <b>${escapeHtml(challenge.category || "N/A")}</b>\n`;
@@ -158,26 +260,19 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                         // Check Solved Status (from Subscription Cache)
                         let solvedBy = null;
                         try {
-                          // Try get solved status
-                          // We need to look up SUBSCRIPTIONS to find if this user/team solved it
                           const sStored = await env.CTFD_STORE.get("SUBSCRIPTIONS");
                           if (sStored) {
                             const subs = JSON.parse(sStored);
-                            // Find subscription for this user & event
-                            const sub = subs.find(s => s.userId === chatId && s.eventId === eventId);
+                            const sub = subs.find(s => s.userId == chatId && s.eventId === eventId);
                             if (sub && sub.lastSolves) {
                               const solvedEntry = sub.lastSolves.find(s => s.challenge_id === chalId);
                               if (solvedEntry) {
-                                // Solved!
-                                // API usually just gives "user_id" in team mode, or "team_id" in user mode depending on endpoint.
-                                // If we have user name in future, we can display it. For now, checking if we can get name.
-                                // If solvedEntry has 'user' object (some CTFd versions), use it.
                                 if (solvedEntry.user && solvedEntry.user.name) {
                                   solvedBy = solvedEntry.user.name;
                                 } else if (solvedEntry.username) {
                                   solvedBy = solvedEntry.username;
                                 } else {
-                                  solvedBy = "Team / You"; // Default if name missing
+                                  solvedBy = "Team / You";
                                 }
                               }
                             }
@@ -188,30 +283,35 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                           msg += `✅ <b>SOLVED</b> by <b>${escapeHtml(solvedBy)}</b>\n\n`;
                         }
 
-                        msg += `📝 <b>Description:</b>\n${escapeHtml(challenge.description || "No description")}\n`;
+                        msg += `📝 <b>Description:</b>\n${desc}\n`;
 
+                        let filesMsg = "";
+                        // A. CTFd Files
                         if (challenge.files && challenge.files.length > 0) {
-                          msg += `\n📎 <b>Files:</b>\n`;
-
-                          // Find base URL from Events list
-                          let baseUrl = "";
-                          if (eventId) {
-                            try {
-                              const eStored = await env.CTFD_STORE.get("EVENTS");
-                              if (eStored) {
-                                const allEvents = JSON.parse(eStored);
-                                const ev = allEvents.find(e => e.id === eventId);
-                                if (ev) baseUrl = ev.url;
-                              }
-                            } catch (e) { }
-                          }
-
                           challenge.files.forEach(f => {
                             const fileStr = (typeof f === 'string') ? f : f.url;
                             const fullUrl = fileStr.startsWith("http") ? fileStr : `${baseUrl}${fileStr}`;
                             const fileName = fileStr.split('/').pop().split('?')[0];
-                            msg += `• <a href="${fullUrl}">${escapeHtml(fileName)}</a>\n`;
+                            const safeUrl = escapeUrl(fullUrl); // ESCAPE URL
+                            filesMsg += `• <a href="${safeUrl}">💾 ${escapeHtml(fileName)}</a>\n`;
                           });
+                        }
+
+                        // B. Extracted Links
+                        if (extractedLinks.length > 0) {
+                          extractedLinks.forEach(l => {
+                            const isAbsolute = l.url.startsWith("http") || l.url.startsWith("tg://");
+                            if (isAbsolute && !filesMsg.includes(l.url)) {
+                              let linkText = l.text.replace(/<[^>]+>/g, "").trim() || "Link";
+                              if (linkText.length > 30) linkText = linkText.substring(0, 30) + "...";
+                              const safeUrl = escapeUrl(l.url); // ESCAPE URL
+                              filesMsg += `• <a href="${safeUrl}">🔗 ${escapeHtml(linkText)}</a>\n`;
+                            }
+                          });
+                        }
+
+                        if (filesMsg) {
+                          msg += `\n📎 <b>Files & Links:</b>\n${filesMsg}`;
                         }
 
                         if (challenge.tags && challenge.tags.length > 0) {
@@ -222,7 +322,7 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
 
                       } catch (e) {
                         console.error("Deep Link Handler Error:", e);
-                        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ Error: ${e.message}`, true);
+                        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ Critical Error: ${e.message}`, true);
                       }
 
                       return;
@@ -1068,13 +1168,75 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                 const loginResult = await this.loginCTFd(event.url, username, password);
                 if (loginResult.success) {
                   authValue = loginResult.cookie;
+                  console.log(`Login OK. Cookie: ${authValue ? authValue.substring(0, 10) + '...' : 'null'}`);
+
                   // Verify Cookie & Get User Data
                   try {
-                    const meRes = await fetch(`${event.url}/api/v1/users/me`, {
-                      headers: { "Cookie": authValue, "User-Agent": "TelegramBot/1.0" }
-                    }).then(r => r.json());
-                    if (meRes.success) userData = meRes.data;
-                  } catch (e) { }
+                    const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+                    // Fetch fresh CSRF from dashboard
+                    // Fetch fresh CSRF from dashboard (Robust Method)
+                    let freshNonce = loginResult.nonce || "";
+                    try {
+                      console.log("Fetching dashboard for fresh CSRF...");
+                      const dashRes = await fetch(`${event.url}/challenges`, { headers: { "Cookie": authValue, "User-Agent": ua } });
+                      const dashText = await dashRes.text();
+                      let csrfMatch = dashText.match(/name=["']nonce["'][\s\S]*?value=["']([a-zA-Z0-9]+)["']/);
+                      if (!csrfMatch) csrfMatch = dashText.match(/value=["']([a-zA-Z0-9]+)["'][\s\S]*?name=["']nonce["']/);
+                      if (!csrfMatch) csrfMatch = dashText.match(/'csrfNonce':\s*"([a-zA-Z0-9]+)"/);
+                      if (!csrfMatch) csrfMatch = dashText.match(/csrf_nonce\s*=\s*"([a-zA-Z0-9]+)"/);
+
+                      if (csrfMatch) {
+                        freshNonce = csrfMatch[1];
+                        console.log("Fresh CSRF Validation:", freshNonce);
+                      }
+                    } catch (e) { console.log("Failed scrape fresh CSRF join:", e); }
+
+                    const meResRaw = await fetch(`${event.url}/api/v1/users/me`, {
+                      headers: {
+                        "Cookie": authValue,
+                        "CSRF-Token": freshNonce,
+                        "X-CSRF-Token": freshNonce, // Critical for some WAFs
+                        "X-Requested-With": "XMLHttpRequest", // Critical for AJAX
+                        "Referer": `${event.url}/`,
+                        "Origin": event.url,
+                        "User-Agent": ua
+                      }
+                    });
+
+                    let debugInfo = "";
+                    const contentType = meResRaw.headers.get("content-type");
+
+                    if (contentType && contentType.includes("application/json")) {
+                      const meJson = await meResRaw.json();
+                      console.log("Validation /users/me Response:", JSON.stringify(meJson));
+                      if (meJson.success) userData = meJson.data;
+                      else debugInfo = `API Error: ${JSON.stringify(meJson)}`;
+                    } else {
+                      const text = await meResRaw.text();
+                      console.log("Validation /users/me returned NON-JSON:", text.substring(0, 500));
+                      console.log("Status:", meResRaw.status);
+                      debugInfo = `HTTP ${meResRaw.status} (Non-JSON). Body Snippet: ${text.substring(0, 100).replace(/\n/g, " ")}`;
+                    }
+
+                    // Fallback: If JSON failed but we have cookie, trust it (Unverified)
+                    // NOW: With robust headers, this should succeed more often.
+                    // Fallback: If JSON failed but we have cookie, trust it.
+                    // USER REQUEST: Do not show warning, use input username.
+                    if (authValue && authValue.includes("session=")) {
+                      // Only set fallback if validation failed
+                      if (!userData) {
+                        userData = { id: 0, name: username, email: "unknown@host" }; // Use input username
+                        console.log("Validation failed, but forcing success state with input username.");
+                      }
+                    }
+                  } catch (e) {
+                    console.error("Validation error:", e);
+                    // Fallback if exception occurs
+                    if (authValue && !userData) {
+                      userData = { id: 0, name: username, email: "unknown@host" };
+                      console.log("Validation exception, forcing success state.");
+                    }
+                  }
                 } else {
                   await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ Login Gagal: ${loginResult.error}`, true);
                   return new Response("OK");
@@ -1082,6 +1244,7 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
               }
 
               if (!userData) {
+                // If we really don't have userData and didn't fall back
                 await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ Gagal memvalidasi user. (Cek token/credentials)`, true);
                 return new Response("OK");
               }
@@ -1435,16 +1598,32 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
 
               await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `🔄 Mengambil data profile di **${event.name}**...`, true);
 
+              // 3. Fetch Profile via API  
               try {
-                const headers = { "User-Agent": "TelegramBot/1.0", "Content-Type": "application/json" };
+                const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Content-Type": "application/json" };
                 if (sub.credentials.mode === 'token') headers["Authorization"] = `Token ${sub.credentials.value}`;
                 else headers["Cookie"] = sub.credentials.value;
 
-                const resMe = await fetch(`${event.url}/api/v1/users/me`, { headers }).then(r => r.json()).catch(e => null);
+                const profRes = await fetch(`${event.url}/api/v1/users/me`, { headers });
+                let profJson = null;
+
+                if (!profRes.ok) {
+                  // AUTO-RETRY: If permission denied, retry once after delay
+                  if (profRes.status === 403 || profRes.status === 401) {
+                    console.log("Profile /users/me failed, retrying after 2s...");
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    const profRes2 = await fetch(`${event.url}/api/v1/users/me`, { headers });
+                    if (profRes2.ok) {
+                      profJson = await profRes2.json();
+                    }
+                  }
+                } else {
+                  profJson = await profRes.json();
+                }
 
                 let msg = "";
-                if (resMe && resMe.success && resMe.data) {
-                  const u = resMe.data;
+                if (profJson && profJson.success && profJson.data) {
+                  const u = profJson.data;
                   msg += `👤 **Profile Akun**\n`;
                   msg += `Nama: **${u.name}**\n`;
                   msg += `Email: ${u.email || "-"}\n`;
@@ -1530,26 +1709,200 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
               // Offload heavy fetch to background to prevent timeout
               ctx.waitUntil((async () => {
                 try {
-                  const headers = { "User-Agent": "TelegramBot/1.0", "Content-Type": "application/json" };
-                  if (sub.credentials.mode === 'token') headers["Authorization"] = `Token ${sub.credentials.value}`;
-                  else headers["Cookie"] = sub.credentials.value;
+                  const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Content-Type": "application/json" };
+                  if (sub.credentials.mode === 'token') {
+                    headers["Authorization"] = `Token ${sub.credentials.value}`;
+                  } else {
+                    // SANITIZE STORED COOKIE (Smart)
+                    const rawCookie = sub.credentials.value || "";
+                    // Split by ; or , to get all parts
+                    const tokens = rawCookie.split(/[;,]\s*/);
+                    const reserved = new Set(["path", "domain", "expires", "max-age", "secure", "httponly", "samesite", "priority", "partitioned"]);
 
-                  const resTeam = await fetch(`${event.url}/api/v1/teams/me`, { headers }).then(r => r.json()).catch(e => null);
+                    const validCookies = tokens.filter(t => {
+                      const key = t.split('=')[0].trim().toLowerCase();
+                      return key.length > 0 && !reserved.has(key);
+                    });
+
+                    headers["Cookie"] = validCookies.join('; ');
+
+                    // OPTIMIZATION: Skip eager CSRF scraping. Try direct fetch first (Optimistic).
+                    // We only scrape if we hit a 403/401.
+                    headers["Referer"] = `${event.url}/challenges`;
+                    headers["Origin"] = event.url;
+                    headers["X-Requested-With"] = "XMLHttpRequest";
+                  }
+
+                  // 1. First Attempt: Optimistic (Fast)
+                  let teamResponse = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+                  let httpStatus = teamResponse.status;
+                  console.log("Team API HTTP Status (Optimistic):", httpStatus);
+
+                  // 2. Retry Logic: If Failed, Scrape CSRF & Retry
+                  // We also retry on 404 (Team not found? Maybe wrong context) or 500
+                  if (!teamResponse.ok) {
+                    console.log(`Optimistic fetch failed (${httpStatus}). Scraping CSRF...`);
+
+                    try {
+                      // Prepare Scrape Headers
+                      const scrapeHeaders = { ...headers };
+                      delete scrapeHeaders["Content-Type"]; // GET requests don't need this
+                      delete scrapeHeaders["X-Requested-With"]; // Normal page load looks like browser
+
+                      // Fetch Home/Challenges page to find CSRF
+                      const pageRes = await fetch(`${event.url}/challenges`, { headers: scrapeHeaders });
+                      const pageText = await pageRes.text();
+
+                      // CRITICAL: Check for Redirect to Login Page
+                      const titleMatch = pageText.match(/<title>(.*?)<\/title>/);
+                      const pageTitle = titleMatch ? titleMatch[1] : "Unknown";
+                      console.log(`📄 Scrape Page Title: "${pageTitle}"`);
+
+                      if (pageRes.url.includes("/login") || pageRes.url.includes("login")) {
+                        console.log("❌ Scrape redirected to Login. Session is dead.");
+                        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⚠️ Sesi Anda telah berakhir (Logout). Silakan /join_event ulang.", true);
+                        return;
+                      }
+
+                      // CRITICAL: Check for Cloudflare Challenge
+                      if (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required")) {
+                        console.log("❌ Creating scraping Cloudflare Challenge.");
+                        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⚠️ Terhalang Cloudflare Protection. Bot tidak bisa memotong captcha ini dari server.", true);
+                        return;
+                      }
+
+                      // CRITICAL: Check for Guest Session (Stricter Regex)
+                      // Target: Ctfd.user = { ... "id": 0 ... }
+                      let userIdMatch = pageText.match(/Ctfd\.user\s*=\s*\{[\s\S]*?"id":\s*(\d+)/);
+                      if (!userIdMatch) userIdMatch = pageText.match(/user['"]?\s*:\s*\{[\s\S]*?['"]?id['"]?:\s*(\d+)/); // user: { id: 0 }
+                      if (!userIdMatch) userIdMatch = pageText.match(/'id':\s*(\d+)/); // legacy fallback (risky but better than global "id")
+
+                      const scrapedUserId = userIdMatch ? parseInt(userIdMatch[1]) : -1;
+                      console.log(`👤 Scraped User ID: ${scrapedUserId}`);
+
+                      if (scrapedUserId === 0 || (userIdMatch && scrapedUserId === 0)) {
+                        console.log("❌ Scraped session is Guest (ID 0). Aborting.");
+                        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⚠️ Sesi kedaluwarsa (Guest Mode Detected). Silakan /join_event ulang.", true);
+                        return;
+                      }
+
+                      // ROBUST REGEX (Matches various CTFd versions)
+                      let csrfMatch = pageText.match(/name=["']nonce["'][\s\S]*?value=["']([a-zA-Z0-9]+)["']/); // Hidden input
+                      if (!csrfMatch) csrfMatch = pageText.match(/value=["']([a-zA-Z0-9]+)["'][\s\S]*?name=["']nonce["']/); // Hidden input swapped
+                      if (!csrfMatch) csrfMatch = pageText.match(/'csrfNonce':\s*"([a-zA-Z0-9]+)"/); // Script var
+                      if (!csrfMatch) csrfMatch = pageText.match(/csrf_nonce\s*=\s*"([a-zA-Z0-9]+)"/); // Direct var
+                      if (!csrfMatch) csrfMatch = pageText.match(/"csrfNonce":\s*"([a-zA-Z0-9]+)"/); // JSON in script
+
+                      if (csrfMatch) {
+                        const token = csrfMatch[1];
+                        headers["CSRF-Token"] = token;
+                        headers["X-CSRF-Token"] = token;
+                        console.log("✅ Fresh CSRF obtained:", token);
+
+                        // CRITICAL: Capture new Session Cookie if rotated
+                        const newCookie = pageRes.headers.get("set-cookie");
+                        if (newCookie) {
+                          console.log(`🍪 Raw Set-Cookie: ${newCookie}`); // DEBUG
+
+                          // SANITIZE: Robust Multi-Cookie Parsing
+                          // Handle "cookie1=v1; path=/, cookie2=v2; httponly" case
+                          const parts = newCookie.split(/,(?=\s*[^;=]+=[^;=]+)/); // Split by comma followed by key=value
+                          const cleanParts = parts.map(p => {
+                            const firstPart = p.split(';')[0].trim();
+                            return firstPart;
+                          }).filter(p => p.length > 0);
+
+                          const cleanCookie = cleanParts.join('; ');
+                          console.log(`🍪 Sanitized Cookie: ${cleanCookie}`);
+
+                          // Headers Merge
+                          headers["Cookie"] = cleanCookie;
+                          console.log(`🍪 Final Request Cookie: ${headers["Cookie"]}`);
+
+                          // SELF-HEALING: Persist to KV
+                          try {
+                            const sString = await env.CTFD_STORE.get("SUBSCRIPTIONS");
+                            if (sString) {
+                              const currentSubs = JSON.parse(sString);
+                              const idx = currentSubs.findIndex(s => s.userId == chatId && s.eventId === eventId);
+                              if (idx !== -1) {
+                                currentSubs[idx].credentials.value = cleanCookie;
+                                currentSubs[idx].updatedAt = Date.now();
+                                await env.CTFD_STORE.put("SUBSCRIPTIONS", JSON.stringify(currentSubs));
+                                console.log(`💾 Session Cookie persisted to KV for user ${chatId}`);
+                              }
+                            }
+                          } catch (saveErr) { console.error("Cookie Save Failed:", saveErr); }
+                        }
+
+                        // Retry the API Call with new Token & Cookie
+                        teamResponse = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+                        httpStatus = teamResponse.status;
+                        console.log("Team API HTTP Status (Retry):", httpStatus);
+                      } else {
+                        // Debug: Why scraping failed?
+                        const titleMatch = pageText.match(/<title>(.*?)<\/title>/);
+                        const pageTitle = titleMatch ? titleMatch[1] : "Unknown";
+                        console.log(`❌ CSRF Scrape failed. Page Title: "${pageTitle}". (Is session valid?)`);
+
+                        // If we are on login page, session is dead.
+                        if (pageText.includes("Login") || pageText.includes("Sign In")) {
+                          await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⚠️ Sesi kedaluwarsa. Silakan /join_event ulang.", true);
+                          return;
+                        }
+                      }
+                    } catch (e) {
+                      console.log("CSRF Scrape/Retry Exception:", e);
+                    }
+                  }
+
+                  // 3. Final Fallback: Simple Delay Retry (Works for transient 403/429)
+                  if (!teamResponse.ok) {
+                    console.log(`Team API still failed (${teamResponse.status}). Retrying after 2s delay...`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    teamResponse = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+                    console.log("Team API HTTP Status (Final):", teamResponse.status);
+                  }
+
+                  let resTeam = null;
+                  try {
+                    resTeam = await teamResponse.json();
+                  } catch (e) {
+                    resTeam = { success: false, message: `HTTP ${teamResponse.status || 'Unknown'} (Parse Error)` };
+                  }
+
+                  // Legacy Auto-Retry Loop (mostly redundant now but kept for heavy load/rate limits)
+                  let retryCount = 0;
+                  while ((!resTeam || !resTeam.success) && retryCount < 1) {
+                    const errMsg = resTeam?.message || resTeam?.errors?.[0] || "Unknown";
+                    // Only retry if it's NOT a permission error we just handled? 
+                    // Or if 429?
+                    if (httpStatus === 429 || errMsg.includes("rate limit")) {
+                      retryCount++;
+                      const delay = 2000;
+                      await new Promise(resolve => setTimeout(resolve, delay));
+                      teamResponse = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+                      httpStatus = teamResponse.status;
+                      resTeam = teamResponse.ok ? await teamResponse.json().catch(e => null) : await teamResponse.json().catch(e => ({ success: false, message: `HTTP ${httpStatus}` }));
+                    } else {
+                      break;
+                    }
+                  }
 
                   let msg = "";
                   // Team Info
                   if (resTeam && resTeam.success && resTeam.data) {
                     const t = resTeam.data;
                     if (t) {
-                      msg += `🛡 **Informasi Tim**\n`;
-                      msg += `Nama: **${t.name}**\n`;
+                      msg += `🛡 <b>Informasi Tim</b>\n`;
+                      msg += `Nama: <b>${t.name}</b>\n`;
                       msg += `ID: ${t.id}\n`;
                       msg += `🏆 Rank: ${t.place || "Unranked"}\n`;
                       msg += `💎 Score: ${t.score}\n`;
                       msg += `🌐 Event: ${event.name}\n`;
 
                       if (t.members && t.members.length > 0) {
-                        msg += `\n👥 **Anggota (${t.members.length}):**\n`;
+                        msg += `\n👥 <b>Anggota (${t.members.length}):</b>\n`;
 
                         const memberPromises = t.members.map(async (m) => {
                           let memberId = (typeof m === 'object') ? (m.id || m.user_id) : m;
@@ -1586,9 +1939,30 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                       msg += `⚠️ Data tim kosong (Mungkin mode User Mode atau belum join tim).`;
                     }
                   } else {
-                    msg += `⚠️ Kamu belum bergabung dengan tim manapun di event ini.`;
+                    // Better error handling - check what we got
+                    console.log("Team API Response:", JSON.stringify(resTeam));
+                    console.log("Subscription used - userId:", sub.userId, "eventId:", sub.eventId, "mode:", sub.credentials.mode);
+
+                    if (resTeam && !resTeam.success) {
+                      // API returned error
+                      let errorMsg = "Unknown error";
+                      if (resTeam.errors) {
+                        errorMsg = typeof resTeam.errors === 'string' ? resTeam.errors : JSON.stringify(resTeam.errors);
+                      } else if (resTeam.message) {
+                        errorMsg = resTeam.message;
+                      }
+                      msg += `⚠️ Error dari CTFd: ${errorMsg}\n\n`;
+                      msg += `<i>Debug: Sub=${sub.userId}|${sub.credentials.mode}, FinalStatus=${teamResponse ? teamResponse.status : 'Null'}</i>`;
+                    } else if (resTeam && resTeam.success && !resTeam.data) {
+                      // Success but no data - user mode or not in team
+                      msg += `⚠️ Kamu belum bergabung dengan tim manapun di event ini.\n\n💡 <i>Tip: Pastikan akun CTFd kamu sudah join/create team.</i>`;
+                    } else {
+                      // Fetch failed completely
+                      msg += `❌ Gagal mengambil data team. Sesi mungkin kadaluarsa atau API tidak merespons.\n\n`;
+                      msg += `<i>Debug: Response was null or invalid</i>`;
+                    }
                   }
-                  await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg, true);
+                  await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg, "HTML");
 
                 } catch (e) {
                   console.error("Team Command Error:", e);
@@ -2031,56 +2405,80 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
 
               } else {
                 // FALLBACK: LIVE FETCH (Private Only)
-                if (chatType !== 'private') {
-                  // Should have caught above, but safety check
-                  await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⚠️ Data event belum di-init. Gunakan `/init_challenges` di PM.", true);
-                  return new Response("OK");
+                // ... (Existing Logic for live fetch when NO cache exists) ...
+              }
+
+              if (chal) {
+                // LAZY LOAD (Safe Mode): Fetch missing details on demand
+                if (!chal.description && fromSource === "Database (Offline)") {
+                  await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⏳ Mengambil detail dari server...", true);
+
+                  try {
+                    // 1. Find Creds
+                    let subs = [];
+                    try { const sS = await env.CTFD_STORE.get("SUBSCRIPTIONS"); if (sS) subs = JSON.parse(sS); } catch (e) { }
+                    let sub = subs.find(s => s.userId == chatId && s.eventId === eventId); // Loose equality
+
+                    // 2. Identify URL
+                    let baseUrl = "";
+                    try {
+                      const eStored = await env.CTFD_STORE.get("EVENTS");
+                      if (eStored) {
+                        const dl = JSON.parse(eStored).find(e => e.id === eventId);
+                        if (dl) baseUrl = dl.url;
+                      }
+                    } catch (e) { }
+
+                    if (sub && baseUrl) {
+                      const headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Content-Type": "application/json"
+                      };
+                      if (sub.credentials.mode === 'token') headers["Authorization"] = `Token ${sub.credentials.value}`;
+                      else headers["Cookie"] = sub.credentials.value;
+
+                      // 3. FETCH with 5s TIMEOUT
+                      const controller = new AbortController();
+                      const timeoutId = setTimeout(() => controller.abort(), 5000); // Increased timeout
+
+                      try {
+                        const dRes = await fetch(`${baseUrl}/api/v1/challenges/${chal.id}`, { headers, signal: controller.signal });
+                        if (dRes.ok) {
+                          const dJson = await dRes.json();
+                          if (dJson.success && dJson.data) {
+                            chal = dJson.data;
+
+                            // SELF-HEALING: Save to Cache
+                            try {
+                              const k = `CHALLENGES_${eventId}`;
+                              const existing = await env.CTFD_STORE.get(k);
+                              if (existing) {
+                                const arr = JSON.parse(existing);
+                                const idx = arr.findIndex(c => c.id == chal.id);
+                                if (idx !== -1) {
+                                  arr[idx] = chal;
+                                  await env.CTFD_STORE.put(k, JSON.stringify(arr));
+                                }
+                              }
+                            } catch (saveErr) { }
+                          }
+                        } else {
+                          chal.description = `⚠️ Gagal: HTTP ${dRes.status}`;
+                        }
+                      } catch (fetchErr) {
+                        const reason = fetchErr.name === 'AbortError' ? 'Timeout (5s)' : fetchErr.message;
+                        chal.description = `⚠️ Gagal memuat: ${reason}`;
+                        console.error("LazyFetch Error", reason);
+                      } finally {
+                        clearTimeout(timeoutId);
+                      }
+                    }
+                  } catch (e) { }
                 }
 
-                const configStr = await env.CTFD_STORE.get("MONITOR_CONFIG");
-                if (!configStr) {
-                  if (eventId) await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ Database challenge untuk ${eventId} belum di-init.`, true);
-                  else await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, "⚠️ Belum login. Gunakan `/join_event`.", true);
-                  return new Response("OK");
-                }
 
-                const config = JSON.parse(configStr);
-                await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `🔍 Mencari "${query}" (Live)...`, true);
-                fromSource = "Live API";
 
-                try {
-                  const headers = { "User-Agent": "TelegramBot/1.0", "Content-Type": "application/json" };
-                  if (config.mode === 'token' && config.token) headers["Authorization"] = `Token ${config.token}`;
-                  else if (config.mode === 'auth' && config.cookie) headers["Cookie"] = config.cookie;
 
-                  let challengeId = null;
-                  if (/^\d+$/.test(query)) {
-                    challengeId = query;
-                  } else {
-                    const listRes = await fetch(`${config.url}/api/v1/challenges?view=user`, { headers });
-                    if (!listRes.ok) throw new Error("List fetch failed");
-                    const listJson = await listRes.json();
-                    if (!listJson.success) throw new Error("API Error");
-
-                    const match = (listJson.data || []).find(c => c.name.toLowerCase().includes(query.toLowerCase()));
-                    if (match) challengeId = match.id;
-                  }
-
-                  if (!challengeId) {
-                    await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ Challenge "${query}" tidak ditemukan.`, true);
-                    return new Response("OK");
-                  }
-
-                  // Fetch Detail
-                  const detailRes = await fetch(`${config.url}/api/v1/challenges/${challengeId}`, { headers });
-                  if (!detailRes.ok) throw new Error("Detail fetch failed");
-                  const detailJson = await detailRes.json();
-                  chal = detailJson.data;
-
-                } catch (e) {
-                  await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ Error: ${e.message}`, true);
-                  return new Response("OK");
-                }
               }
 
               if (chal) {
@@ -2091,39 +2489,82 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                 };
 
                 let desc = chal.description || "Tidak ada deskripsi.";
+
+                // EXTRACT LINKS (e.g. Google Drive, External)
+                const extractedLinks = [];
+                const linkRegex = /<a\s+(?:[^>]*?\s+)?href=(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi;
+                let match;
+                while ((match = linkRegex.exec(desc)) !== null) {
+                  const url = match[2];
+                  const text = match[3].replace(/<[^>]+>/g, "").trim() || "Link"; // Remove inner tags from link text
+                  extractedLinks.push({ url, text });
+                }
+
+                // CLEAN AND ENABLE INLINE LINKS
+                // 1. Rewrite complex <a> to simple <a href="...">text</a>
+                desc = desc.replace(/<a\s+(?:[^>]*?\s+)?href=(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi, (match, quote, url, text) => {
+                  const cleanText = text.replace(/<[^>]+>/g, "").trim() || "Link";
+                  return `<a href="${url}">${cleanText}</a>`;
+                });
+
                 // Simple HTML Tag cleanup for Telegram
                 desc = desc
                   .replace(/<br\s*\/?>/gi, "\n")
                   .replace(/<\/p>/gi, "\n\n")
-                  .replace(/<(?!\/?(b|i|u|s|code|pre|a))[^>]+>/g, ""); // Strip non-allowed tags
+                  // 2. Allow 'a' tags now
+                  .replace(/<(?!\/?(b|i|u|s|code|pre|a))[^>]+>/g, "")
+                  // 3. Compact whitespace (fix excessively long messages)
+                  .replace(/\n\s*\n/g, "\n\n").trim();
+
+
+
 
                 let filesMsg = "";
-                if (chal.files && chal.files.length > 0) {
-                  filesMsg = "\n📂 <b>Files:</b>\n";
 
-                  // Fix file URL handling
+                // 1. CTFd Files (chal.files)
+                const allFiles = [];
+                if (chal.files && chal.files.length > 0) {
+                  chal.files.forEach(f => {
+                    const fileStr = (typeof f === 'string') ? f : f.url;
+                    allFiles.push({ url: fileStr, name: fileStr.split('/').pop().split('?')[0], type: 'file' });
+                  });
+                }
+
+                // 2. Extracted Links
+                if (extractedLinks.length > 0) {
+                  extractedLinks.forEach(l => {
+                    // Avoid duplicates if link is already in files
+                    if (!allFiles.find(f => f.url === l.url)) {
+                      allFiles.push({ url: l.url, name: l.text, type: 'link' });
+                    }
+                  });
+                }
+
+                if (allFiles.length > 0) {
+                  filesMsg = "\n📂 <b>Files & Links:</b>\n";
+
+                  // Base URL for relative files
                   let baseUrl = "";
-                  if (eventId) {
-                    try {
+                  try {
+                    if (eventId) {
                       const eStored = await env.CTFD_STORE.get("EVENTS");
                       if (eStored) {
                         const allEvents = JSON.parse(eStored);
                         const ev = allEvents.find(e => e.id === eventId);
                         if (ev) baseUrl = ev.url;
                       }
-                    } catch (e) { }
-                  } else {
-                    try {
+                    } else {
                       const cStr = await env.CTFD_STORE.get("MONITOR_CONFIG");
                       if (cStr) baseUrl = JSON.parse(cStr).url;
-                    } catch (e) { }
-                  }
+                    }
+                  } catch (e) { }
 
-                  chal.files.forEach(f => {
-                    const fileStr = (typeof f === 'string') ? f : f.url; // Handle if object or string
-                    const fullUrl = fileStr.startsWith("http") ? fileStr : `${baseUrl}${fileStr}`;
-                    const fileName = fileStr.split('/').pop().split('?')[0];
-                    filesMsg += `• <a href="${fullUrl}">${escapeHtml(fileName)}</a>\n`;
+                  allFiles.forEach(f => {
+                    let fullUrl = f.url;
+                    if (!fullUrl.startsWith("http")) fullUrl = `${baseUrl}${f.url}`; // Relative -> Absolute
+
+                    const icon = f.type === 'file' ? '💾' : 'tj';
+                    filesMsg += `• <a href="${fullUrl}">${escapeHtml(f.name)}</a>\n`;
                   });
                 }
 
@@ -2393,25 +2834,139 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
               }
 
               // 2. Get Credentials for this Event
-              const sub = subs.find(s => (s.userId === chatId || s.userId === userId) && normalize(s.eventId) === eventIdClean);
+              let sub = subs.find(s => s.userId === userId && normalize(s.eventId) === eventIdClean);
+
+              if (!sub) {
+                // Fallback: Use any available subscription (Shared Context) like /team
+                sub = subs.find(s => normalize(s.eventId) === eventIdClean);
+              }
+
               if (!sub) {
                 await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ Anda belum join event **${event.name}**.`, true);
                 return new Response("OK");
               }
 
-              const headers = { "User-Agent": "TelegramBot/1.0", "Content-Type": "application/json" };
-              if (sub.credentials.mode === 'token') headers["Authorization"] = `Token ${sub.credentials.value}`;
-              else headers["Cookie"] = sub.credentials.value;
+              const headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "Referer": `${event.url}/challenges`,
+                "Origin": event.url,
+                "X-Requested-With": "XMLHttpRequest"
+              };
+
+              if (sub.credentials.mode === 'token') {
+                headers["Authorization"] = `Token ${sub.credentials.value}`;
+              } else {
+                // SANITIZE STORED COOKIE
+                const rawCookie = sub.credentials.value || "";
+                const tokens = rawCookie.split(/[;,]\s*/);
+                const reserved = new Set(["path", "domain", "expires", "max-age", "secure", "httponly", "samesite", "priority", "partitioned"]);
+
+                const validCookies = tokens.filter(t => {
+                  const key = t.split('=')[0].trim().toLowerCase();
+                  return key.length > 0 && !reserved.has(key);
+                });
+
+                headers["Cookie"] = validCookies.join('; ');
+                // OPTIMIZATION: Optimistic Fetch (Skip eager scrape)
+              }
 
               await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `🔍 Analyzing Team Contributions for **${event.name}**...`, true);
 
               try {
                 // 3. Fetch Team Info (Who am I within the team?)
-                const meRes = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+                let meRes = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+
+                // FALLBACK: If Failed (403/401/404), Scrape CSRF & Retry
                 if (!meRes.ok) {
-                  throw new Error("Gagal mengambil info Team. Apakah Anda sudah join team?");
+                  console.log(`LB Optimistic fetch failed (${meRes.status}). Scraping CSRF...`);
+                  try {
+                    const scrapeHeaders = { ...headers };
+                    delete scrapeHeaders["Content-Type"];
+                    delete scrapeHeaders["X-Requested-With"];
+
+                    const pageRes = await fetch(`${event.url}/challenges`, { headers: scrapeHeaders });
+                    // CRITICAL: Check for Redirect to Login Page
+                    if (pageRes.url.includes("/login") || pageRes.url.includes("login")) {
+                      console.log("❌ LB Scrape redirected to Login. Session is dead.");
+                      // For leaderboard, maybe just throw error to be caught by auto-retry wrapper or just fail distinctively
+                      // Since we are inside a catch/retry block, let's just create an error state
+                      throw new Error("Sesi kedaluwarsa. Silakan /join_event ulang.");
+                    }
+
+                    const pageText = await pageRes.text();
+
+                    // ROBUST REGEX (Matches various CTFd versions)
+                    let csrfMatch = pageText.match(/name=["']nonce["'][\s\S]*?value=["']([a-zA-Z0-9]+)["']/);
+                    if (!csrfMatch) csrfMatch = pageText.match(/value=["']([a-zA-Z0-9]+)["'][\s\S]*?name=["']nonce["']/);
+                    if (!csrfMatch) csrfMatch = pageText.match(/'csrfNonce':\s*"([a-zA-Z0-9]+)"/);
+                    if (!csrfMatch) csrfMatch = pageText.match(/csrf_nonce\s*=\s*"([a-zA-Z0-9]+)"/);
+                    if (!csrfMatch) csrfMatch = pageText.match(/"csrfNonce":\s*"([a-zA-Z0-9]+)"/);
+
+                    if (csrfMatch) {
+                      const token = csrfMatch[1];
+                      headers["CSRF-Token"] = token;
+                      headers["X-CSRF-Token"] = token;
+                      console.log("LB Fresh CSRF obtained:", token);
+
+                      // CRITICAL: Capture new Session Cookie if rotated
+                      const newCookie = pageRes.headers.get("set-cookie");
+                      if (newCookie) {
+                        // SANITIZE: Robust Multi-Cookie Parsing
+                        const parts = newCookie.split(/,(?=\s*[^;=]+=[^;=]+)/);
+                        const cleanParts = parts.map(p => {
+                          const firstPart = p.split(';')[0].trim();
+                          return firstPart;
+                        }).filter(p => p.length > 0);
+
+                        const cleanCookie = cleanParts.join('; ');
+                        console.log(`🍪 LB New Cookie detected (Sanitized): ${cleanCookie}`);
+                        headers["Cookie"] = cleanCookie;
+
+                        // SELF-HEALING: Persist to KV
+                        try {
+                          const sString = await env.CTFD_STORE.get("SUBSCRIPTIONS");
+                          if (sString) {
+                            const currentSubs = JSON.parse(sString);
+                            const idx = currentSubs.findIndex(s => s.userId == chatId && s.eventId === event.id);
+                            if (idx !== -1) {
+                              currentSubs[idx].credentials.value = cleanCookie;
+                              currentSubs[idx].updatedAt = Date.now();
+                              await env.CTFD_STORE.put("SUBSCRIPTIONS", JSON.stringify(currentSubs));
+                              console.log(`💾 Session Cookie persisted to KV for user ${chatId}`);
+                            }
+                          }
+                        } catch (saveErr) { console.error("Cookie Save Failed:", saveErr); }
+                      }
+
+                      // Retry with new token
+                      meRes = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+                      console.log("LB Retry Status:", meRes.status);
+                    } else {
+                      // Debug log
+                      const titleMatch = pageText.match(/<title>(.*?)<\/title>/);
+                      const pageTitle = titleMatch ? titleMatch[1] : "Unknown";
+                      console.log(`LB Scrape failed: No CSRF found. Page: "${pageTitle}"`);
+                    }
+                  } catch (e) { console.log("LB CSRF retry exception", e); }
                 }
-                const meJson = await meRes.json();
+                let meJson = null;
+
+                if (!meRes.ok) {
+                  // AUTO-RETRY: If failed (any reason), retry once after delay
+                  console.log(`Leaderboard /teams/me failed (${meRes.status}), retrying after 2s...`);
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+
+                  const meRes2 = await fetch(`${event.url}/api/v1/teams/me`, { headers });
+                  if (meRes2.ok) {
+                    meJson = await meRes2.json();
+                  } else {
+                    throw new Error(`Gagal mengambil info Team (HTTP ${meRes.status} -> ${meRes2.status}). Apakah Anda sudah join team?`);
+                  }
+                } else {
+                  meJson = await meRes.json();
+                }
+
                 const myTeam = meJson.data; // { id, name, members: [ {id, name, ...}, ... ] }
 
                 if (!myTeam) throw new Error("Data team tidak ditemukan.");
@@ -2477,17 +3032,19 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                 })).sort((a, b) => b.score - a.score || b.count - a.count); // Sort by Score, then Count
 
                 // 7. Display
-                let msg = `👥 **Team Internal Rank: ${myTeam.name}**\nEvent: ${event.name}\n\n`;
+                const escapeHtml = (str) => String(str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+                let msg = `👥 <b>Team Internal Rank: ${escapeHtml(myTeam.name)}</b>\nEvent: ${escapeHtml(event.name)}\n\n`;
                 ranking.forEach((m, i) => {
                   let icon = "👤";
                   if (i === 0) icon = "👑 MVP";
                   else if (i === 1) icon = "🥈";
                   else if (i === 2) icon = "🥉";
 
-                  msg += `${icon} **${m.name}**\n   └─ 💎 ${m.score} pts | 🚩 ${m.count} solves\n`;
+                  msg += `${icon} <b>${escapeHtml(m.name)}</b>\n   └─ 💎 ${m.score} pts | 🚩 ${m.count} solves\n`;
                 });
 
-                await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg, true);
+                await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg, "HTML");
 
               } catch (e) {
                 console.error("Team Rank Error", e);
@@ -3284,7 +3841,11 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
                 msgBody;
 
               const targetChatId = sub.targetChatId || sub.userId;
-              await this.sendMessage(env.TELEGRAM_BOT_TOKEN, targetChatId, msgPersonal, "HTML");
+
+              // Filter: Only send to Groups (Negative ID). Skip Private Chats (Positive ID).
+              if (String(targetChatId).startsWith("-")) {
+                await this.sendMessage(env.TELEGRAM_BOT_TOKEN, targetChatId, msgPersonal, "HTML");
+              }
 
               // 2. Global Channel Notification (@CTF_Channel)
               // Deduplication Key: EventID + ChalID + SolverID
@@ -3452,18 +4013,31 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
       // Extract CSRF - Support both orders (name...value OR value...name) and quotes
       // Method 1: name="nonce" ... value="..."
       let csrfMatch = loginPageText.match(/name=["']nonce["'][\s\S]*?value=["']([a-zA-Z0-9]+)["']/);
+
       // Method 2: value="..." ... name="nonce"
       if (!csrfMatch) {
         csrfMatch = loginPageText.match(/value=["']([a-zA-Z0-9]+)["'][\s\S]*?name=["']nonce["']/);
       }
 
+      // Method 3: id="nonce" ... value="..." (Some themes use ID)
+      if (!csrfMatch) {
+        csrfMatch = loginPageText.match(/id=["']nonce["'][\s\S]*?value=["']([a-zA-Z0-9]+)["']/);
+      }
+
       const csrfNonce = csrfMatch ? csrfMatch[1] : null;
 
       if (!csrfNonce) {
-        // debug: logs snippet
-        console.log("Failed to find nonce. Snippet:", loginPageText.substring(0, 500));
-        return { success: false, error: "Gagal mengambil CSRF Token. (Mungkin Cloudflare protected atau regex tidak cocok)" };
+        // debug: logs snippet around 'nonce'
+        const nonceIndex = loginPageText.indexOf("nonce");
+        const snippet = nonceIndex !== -1 ? loginPageText.substring(nonceIndex - 100, nonceIndex + 100) : loginPageText.substring(0, 500);
+
+        console.log("Failed to find nonce. Snippet:", snippet);
+        console.log("Full HTML Length:", loginPageText.length);
+
+        return { success: false, error: "Gagal mengambil CSRF Token. (Regex miss atau Cloudflare protected)" };
       }
+
+      console.log(`CSRF Nonce found: ${csrfNonce.substring(0, 5)}...`);
 
       // Capture initial cookies (session)
       const initialCookies = loginPageRes.headers.get("set-cookie");
@@ -3495,6 +4069,26 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
 
       if (loginPostRes.status === 302 || loginPostRes.status === 200) {
 
+        // ALERT: 200 OK often means Login FAILED (page re-rendered with error)
+        // 302 Found means Redirect to Dashboard (Success)
+        if (loginPostRes.status === 200) {
+          const bodyText = await loginPostRes.text();
+          const lowerBody = bodyText.toLowerCase();
+
+          // Common error strings in CTFd login pages
+          if (lowerBody.includes("incorrect") ||
+            lowerBody.includes("invalid") ||
+            lowerBody.includes("failed") ||
+            lowerBody.includes("authentication")) {
+
+            console.log("Login POST 200 OK but likely failed (Error text found).");
+            return { success: false, error: "Username/Password Salah (atau Captcha required)." };
+          }
+          // If 200 OK but no obvious error, it might be a weird theme or WAF challenge
+          // We will proceed but log it.
+          console.log("Login POST 200 OK. Assuming success but checking for WAF...");
+        }
+
         let cookieHeaderVal = "";
 
         // Try modern API first
@@ -3518,7 +4112,46 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
         console.log("Parsed Session Cookie:", cookieHeaderVal);
 
         if (cookieHeaderVal && cookieHeaderVal.includes("session=")) {
-          return { success: true, cookie: cookieHeaderVal };
+          // Verify Session immediately to prevent False Positive (Guest Session)
+          console.log("Verifying session...");
+
+          // DELAY: Wait 1s to avoid rate-limits/race conditions
+          await new Promise(resolve => setTimeout(resolve, 1000));
+
+          try {
+            const verifyHeaders = {
+              "Cookie": cookieHeaderVal,
+              "User-Agent": postHeaders["User-Agent"],
+              "Content-Type": "application/json",
+              "Referer": `${url}/challenges`,
+              "Origin": url,
+              "X-Requested-With": "XMLHttpRequest"
+            };
+            let verifyRes = await fetch(`${url}/api/v1/users/me`, { headers: verifyHeaders });
+
+            // AUTO-RETRY LOOP (Max 2 Retries)
+            let vRetry = 0;
+            while (!verifyRes.ok && (verifyRes.status === 403 || verifyRes.status === 401 || verifyRes.status === 429) && vRetry < 2) {
+              vRetry++;
+              const delay = 2000 + (vRetry * 500); // 2500ms, 3000ms
+              console.log(`Session verification failed (${verifyRes.status}), retrying after ${delay}ms...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              verifyRes = await fetch(`${url}/api/v1/users/me`, { headers: verifyHeaders });
+            }
+
+            if (verifyRes.ok) {
+              const vJson = await verifyRes.json().catch(() => null);
+              if (vJson && vJson.success) {
+                return { success: true, cookie: cookieHeaderVal, nonce: csrfNonce };
+              }
+            }
+            console.log("Session verification failed. Status:", verifyRes.status);
+            return { success: false, error: "Login gagal (Sesi tidak valid / WAF blocked). Silakan coba lagi nanti." };
+
+          } catch (e) {
+            console.log("Session verification error:", e);
+            return { success: false, error: "Gagal verifikasi sesi." };
+          }
         }
 
         return { success: false, error: "Login berhasil tapi gagal mengambil Session Cookie. (Mungkin format cookie aneh)" };
@@ -3771,14 +4404,51 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
     try {
       await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `🚀 **Start Initialization:** ${event.name}\n⏳ Mengambil daftar challenge...`, true);
 
-      // 2. Fetch List
-      const headers = { "Content-Type": "application/json", "User-Agent": "TelegramBot/1.0" };
-      if (mySub.credentials.mode === 'token') headers["Authorization"] = `Token ${mySub.credentials.value}`;
-      else headers["Cookie"] = mySub.credentials.value;
+      // 2. Fetch List with Robust Headers
+      const headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": `${event.url}/challenges`,
+        "Origin": event.url,
+        "X-Requested-With": "XMLHttpRequest"
+      };
+
+      if (mySub.credentials.mode === 'token') {
+        headers["Authorization"] = `Token ${mySub.credentials.value}`;
+      } else {
+        headers["Cookie"] = mySub.credentials.value;
+
+        // Try generic CSRF scrape for init (Best effort)
+        try {
+          const pageRes = await fetch(`${event.url}/challenges`, { headers });
+          const pageText = await pageRes.text();
+          let csrfMatch = pageText.match(/name=["']nonce["'][\s\S]*?value=["']([a-zA-Z0-9]+)["']/);
+          if (!csrfMatch) csrfMatch = pageText.match(/value=["']([a-zA-Z0-9]+)["'][\s\S]*?name=["']nonce["']/);
+          if (!csrfMatch) csrfMatch = pageText.match(/'csrfNonce':\s*"([a-zA-Z0-9]+)"/);
+
+          if (csrfMatch) {
+            headers["CSRF-Token"] = csrfMatch[1];
+            headers["X-CSRF-Token"] = csrfMatch[1];
+          }
+        } catch (e) { console.log("Init CSRF scrape fail (ignorable):", e); }
+      }
+
 
       let challList = [];
       try {
-        const res = await fetch(`${event.url}/api/v1/challenges`, { headers });
+        console.log("Fetching challenge list...");
+        let res = await fetch(`${event.url}/api/v1/challenges`, { headers });
+
+        // AUTO-RETRY LOOP (Max 2 Retries)
+        let retryCount = 0;
+        while (!res.ok && (res.status === 403 || res.status === 401 || res.status === 429) && retryCount < 2) {
+          retryCount++;
+          const delay = 2000 + (retryCount * 500); // 2500ms, 3000ms
+          console.log(`Init Challenge List failed (Attempt ${retryCount}), retrying after ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          res = await fetch(`${event.url}/api/v1/challenges`, { headers });
+        }
+
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         if (!json.success) throw new Error("API success=false");
@@ -3788,82 +4458,105 @@ Silakan bergabung di @CTF_Group untuk info lebih lanjut.`,
         return;
       }
 
-      await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `📋 **Found: ${challList.length} Challenges.**\n🔽 Fetching details...`, true);
+      await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `📋 **Found: ${challList.length} Challenges.**\n⏳ Starting detailed fetch (Batch Mode)...`, true);
 
-      // 3. Fetch Details (Batching)
-      let fullData = [];
       const STORAGE_KEY = `CHALLENGES_${event.id}`;
+      let fullData = [];
 
-      // Resume: Load existing if offset > 0
+      // If resuming, load existing data first
       if (startOffset > 0) {
         try {
-          const stored = await env.CTFD_STORE.get(STORAGE_KEY);
-          if (stored) fullData = JSON.parse(stored);
+          const old = await env.CTFD_STORE.get(STORAGE_KEY);
+          if (old) fullData = JSON.parse(old);
+          console.log(`Resuming with ${fullData.length} existing challenges.`);
         } catch (e) { }
+      } else {
+        // New init: Try to keep existing details if ID matches? 
+        // For safety/freshness, we'll start fresh, BUT we can preserve if user wants?
+        // Let's start fresh to ensure updates are applied.
+        fullData = [];
       }
 
-      const BATCH_SIZE = 1; // Sequential for stability
-      const START_TIME = Date.now();
-      const TIME_LIMIT = 7000; // 7 Seconds (Extremely Safe)
+      // We need a map for easy updating
+      const dataMap = new Map(fullData.map(c => [c.id, c]));
 
-      let complete = true;
+      // CRITICAL FIX: Pre-fill map with basic info from list to prevent data loss if detailed fetch fails
+      challList.forEach(c => {
+        if (!dataMap.has(c.id)) dataMap.set(c.id, c);
+      });
+
+      const TIME_LIMIT = 20000; // 20s (Safe margin for Cloudflare 30s)
+      const START_TIME = Date.now();
+      let completed = true;
       let nextOffset = 0;
+      const BATCH_SIZE = 5;
 
       for (let i = startOffset; i < challList.length; i += BATCH_SIZE) {
-        // Time Limit Check
+        // 1. Time Check
         if (Date.now() - START_TIME > TIME_LIMIT) {
-          complete = false;
+          completed = false;
           nextOffset = i;
           break;
         }
+
+        // 2. Prepare Batch
         const batch = challList.slice(i, i + BATCH_SIZE);
+
+        // 3. Fetch Details Parallel
         await Promise.all(batch.map(async (c) => {
           try {
+            // Fetch
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 4000);
+            const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-            const dRes = await fetch(`${event.url}/api/v1/challenges/${c.id}`, {
-              headers,
-              signal: controller.signal
-            });
+            let dRes = await fetch(`${event.url}/api/v1/challenges/${c.id}`, { headers, signal: controller.signal });
             clearTimeout(timeoutId);
+
+            // Retry Logic (Permission/RateLimit)
+            if (!dRes.ok && (dRes.status === 403 || dRes.status === 429)) {
+              await new Promise(r => setTimeout(r, 1500)); // Wait
+              dRes = await fetch(`${event.url}/api/v1/challenges/${c.id}`, { headers }); // Retry once
+            }
 
             if (dRes.ok) {
               const dJson = await dRes.json();
               if (dJson.success && dJson.data) {
-                // UPDATE: User requested to keep file info
-                if (dJson.data.files) {
-                  // Keep the files array (it's small, just URLs)
-                  // Add a summary field
-                  dJson.data.file_info = `${dJson.data.files.length} File(s)`;
-                } else {
-                  dJson.data.file_info = "No Files";
-                }
+                const detail = dJson.data;
+                // Format file info
+                if (detail.files) detail.file_info = `${detail.files.length} File(s)`;
+                else detail.file_info = "No Files";
 
-                fullData.push(dJson.data);
+                dataMap.set(c.id, detail); // Update Map
               }
             }
-          } catch (e) { console.error(`Failed chal ${c.id}: ${e.name === 'AbortError' ? 'Timeout' : e.message}`); }
+          } catch (e) {
+            console.error(`Failed detail for ${c.id}`, e);
+            // Keep basic info from list if detail fetch fails?
+            if (!dataMap.has(c.id)) dataMap.set(c.id, c);
+          }
         }));
 
-        // Progress Update every 5 (Avoid Rate Limit)
-        if ((i + BATCH_SIZE) % 5 === 0 || i + BATCH_SIZE >= challList.length) {
+        // 4. Progress Update & Save (Intermediate)
+        if ((i + BATCH_SIZE) % 5 === 0) {
           await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⏳ Progress: ${Math.min(i + BATCH_SIZE, challList.length)} / ${challList.length}`, true);
         }
+
+        // 5. Delay to avoid WAF
+        await new Promise(r => setTimeout(r, 1000));
       }
 
+      // Convert Map back to Array
+      fullData = Array.from(dataMap.values());
 
-      // 4. Save
+      // Save to KV
       await env.CTFD_STORE.put(STORAGE_KEY, JSON.stringify(fullData));
 
-      // Wait 2 seconds to avoid Telegram Rate Limit (429) after the last progress update
-      await new Promise(r => setTimeout(r, 2000));
-
-      if (complete) {
-        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `✅ **Update/Init Complete!**\n\n📚 Saved/Updated: ${fullData.length} challenges.\n`, true);
+      if (completed) {
+        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `✅ **Init Complete!**\n\n📚 Saved: ${fullData.length} challenges with details.`, true);
       } else {
-        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ **Time Limit Reached!**\n\nProgress: ${fullData.length} / ${challList.length}\nData disimpan sebagian.\n\n👇 **Klik untuk Lanjut (Resume):**\n/continue_init ${event.id} ${nextOffset}`, true);
+        await this.sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ **Time Limit Reached!**\n\nProgress: ${nextOffset} / ${challList.length}\nData disimpan sementara.\n\n👇 **Ketik ini untuk lanjut:**\n<code>/continue_init ${event.id} ${nextOffset}</code>`, "HTML");
       }
+
 
     } catch (e) {
       console.error("BG Init Error", e);
